@@ -7,7 +7,7 @@ back to waiting.
 
 Made by **C0P3Y** | **Icarus Interstellar Inc.**
 
-<img src="screenshots/StarCitizenAntiAFK.png" width="407">
+<img src="screenshots/StarCitizenAntiAFK.png" width="407"><img src="screenshots/StarCitizenAntiAFK-2.png">
 
 ## Features
 
