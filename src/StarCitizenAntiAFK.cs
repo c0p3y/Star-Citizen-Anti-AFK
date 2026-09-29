@@ -794,10 +794,8 @@ namespace AntiAfk
             swTray = Place(ctl, new SwitchControl(), 292, 60, 46, 24);
             swTray.Checked = cfg.Tray == 1;
 
-            MakeLabel(this, "Settings are saved next to the app. No registry entries.", 16, 562, 368, 18,
-                Theme.Muted, Theme.Small, ContentAlignment.MiddleCenter, Theme.Bg);
-            MakeLabel(this, "Made by C0P3Y  |  Icarus Interstellar Inc.", 16, 582, 368, 24,
-                Theme.Accent, Theme.Semi, ContentAlignment.MiddleCenter, Theme.Bg);
+            MakeLabel(this, "Settings are saved next to the app. No registry entries.", 16, 572, 368, 24,
+                Theme.Accent, Theme.Small, ContentAlignment.MiddleCenter, Theme.Bg);
 
             swMode.Checked = cfg.Mode == 1;
             ApplyModeVisuals();

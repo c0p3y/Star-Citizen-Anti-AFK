@@ -7,8 +7,6 @@ back to waiting.
 
 Made by **C0P3Y** | **Icarus Interstellar Inc.**
 
-<img src="screenshots/StarCitizenAntiAFK.png" width="407"><img src="screenshots/StarCitizenAntiAFK-2.png">
-
 ## Features
 
 - Single small `.exe` (~60 KB). No installer, no runtime to install (uses the .NET Framework built into Windows).
@@ -19,8 +17,10 @@ Made by **C0P3Y** | **Icarus Interstellar Inc.**
 - Input type switch: **Keyboard** (any key you pick) or **Mouse wiggle** (centers the cursor, moves 10 px right, then back).
 - Global start/stop hotkey (default `Ctrl + Shift + F9`) that works while a game has focus.
 - **Switch to Star Citizen first** toggle: before each AFK input the app makes `StarCitizen.exe` the active
-  window, so inputs land in the game even if you alt-tabbed away. If the game isn't running, nothing is switched
-  and input goes to the current window, so the app still works for other games.
+  window, so inputs land in the game even if you alt-tabbed away. If `StarCitizen.exe` isn't running, or is
+  running but can't be focused, that round of input is skipped entirely — nothing is sent to whatever window
+  happens to be active (your browser, Discord, etc.). Turn the toggle off to use the app as a plain anti-AFK
+  for any other window or game.
 - Runs in the background with a tray icon (grey = stopped, amber = waiting, green = AFK input active).
 - Dark, modern UI with high-DPI support.
 
@@ -59,9 +59,10 @@ The source is written in C# 5 style on purpose so this built-in compiler can bui
   A later timestamp that doesn't match means something else (you) produced input, so it returns to waiting.
 - **Sending input:** `SendInput` with hardware scan codes for keys, and a relative mouse move for the wiggle.
 - **Focusing the game:** finds the `StarCitizen` process's main window and uses the standard
-  `AttachThreadInput` + `SetForegroundWindow` approach, with `SwitchToThisWindow` as a fallback. If the game is
-  running but can't be focused, that round of input is skipped and retried a few seconds later, so keys are never
-  typed into an unrelated window.
+  `AttachThreadInput` + `SetForegroundWindow` approach, with `SwitchToThisWindow` as a fallback. With the
+  "Switch to Star Citizen first" toggle on, an input round is sent only when the game was actually focused;
+  if it isn't running, or is running but can't be focused, that round is skipped and retried a few seconds
+  later — nothing is ever typed into whatever window happens to be active.
 - **Hotkey:** `RegisterHotKey`; the app reports if another program already owns the combination.
 
 ## Settings file
