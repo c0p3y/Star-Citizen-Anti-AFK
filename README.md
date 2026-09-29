@@ -7,7 +7,7 @@ back to waiting.
 
 Made by **C0P3Y** | **Icarus Interstellar Inc.**
 
-![Star Citizen Anti AFK UI] (screenshots/StarCitizenAntiAFK.png)
+<img src="screenshots/StarCitizenAntiAFK.png" width="407">
 
 ## Features
 
