@@ -5,7 +5,7 @@ time you choose, optionally brings **StarCitizen.exe** to the front, and then se
 wiggle at an interval you choose. The moment you touch your keyboard or mouse again, it stands down and goes
 back to waiting.
 
-
+<img src="screenshots/StarCitizenAntiAFK.png"><img src="screenshots/StarCitizenAntiAFK-2.png">
 
 ## Features
 
