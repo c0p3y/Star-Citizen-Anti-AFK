@@ -984,9 +984,9 @@ namespace AntiAfk
                 if (cfg.FocusGame == 1)
                 {
                     focus = GameFocus.Activate();
-                    // Game running but couldn't be focused: skip this round rather than typing into another app.
-                    if (focus == FocusResult.Failed) ok = false;
-                    // Game not running: leave the active window alone and carry on as a normal anti-AFK.
+                    // Star Citizen isn't running, or is running but couldn't be focused: send nothing this
+                    // round rather than typing into whatever window happens to be active (e.g. a browser).
+                    if (focus != FocusResult.Focused) ok = false;
                 }
                 if (ok)
                 {
@@ -1007,7 +1007,7 @@ namespace AntiAfk
             switch (focus)
             {
                 case FocusResult.Focused: return "  |  Star Citizen focused";
-                case FocusResult.Failed: return "  |  focus failed, retrying";
+                case FocusResult.Failed: return "  |  couldn't focus Star Citizen, retrying";
                 default: return "  |  Star Citizen not running";
             }
         }
@@ -1045,8 +1045,14 @@ namespace AntiAfk
                     break;
                 default:
                     long left = Math.Max(0, (nextFireMs - now + 999) / 1000);
-                    status.Set(Theme.Green, "AFK mode active",
-                        "Sent " + sent + "  |  next in " + left + " s" + FocusNote());
+                    bool withheld = cfg.FocusGame == 1 && focus != FocusResult.Focused;
+                    if (withheld)
+                        status.Set(Theme.Amber, "AFK mode - no input sent",
+                            (focus == FocusResult.Failed ? "Couldn't focus Star Citizen" : "Star Citizen not running") +
+                            "   |   checking again in " + left + " s");
+                    else
+                        status.Set(Theme.Green, "AFK mode active",
+                            "Sent " + sent + "  |  next in " + left + " s" + FocusNote());
                     break;
             }
         }
