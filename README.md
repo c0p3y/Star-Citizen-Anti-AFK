@@ -7,6 +7,8 @@ back to waiting.
 
 Made by **C0P3Y** | **Icarus Interstellar Inc.**
 
+![Star Citizen Anti AFK UI] (screenshots/StarCitizenAntiAFK.png)
+
 ## Features
 
 - Single small `.exe` (~60 KB). No installer, no runtime to install (uses the .NET Framework built into Windows).
