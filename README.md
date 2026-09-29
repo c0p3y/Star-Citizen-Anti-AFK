@@ -5,7 +5,7 @@ time you choose, optionally brings **StarCitizen.exe** to the front, and then se
 wiggle at an interval you choose. The moment you touch your keyboard or mouse again, it stands down and goes
 back to waiting.
 
-Made by **C0P3Y** | **Icarus Interstellar Inc.**
+
 
 ## Features
 
