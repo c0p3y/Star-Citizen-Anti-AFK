@@ -2,21 +2,28 @@
 // Made by C0P3Y | Icarus Interstellar Inc.
 //
 //  * Single portable .exe, uses the .NET Framework 4.x that ships with Windows (no install).
-//  * Zero registry access. Settings live in AntiAFK.ini next to the exe
-//    (falls back to %LOCALAPPDATA%\AntiAFK\ if the exe folder is read-only).
+//  * Zero registry access. Settings live in StarCitizenAntiAFK.ini next to the exe
+//    (falls back to %LOCALAPPDATA%\StarCitizenAntiAFK\ if the exe folder is read-only).
+//  * Optional auto-accept: reads the top-centre HUD of Star Citizen with the OCR engine built into
+//    Windows 10/11 (via reflection, no extra files) and presses [ for mission / party invites.
 //  * Idle detection uses GetLastInputInfo (passive, no hooks). Its own injected input is
 //    fingerprinted so only REAL keyboard/mouse activity returns it to "waiting".
 //  * Written in C# 5 style so it can be rebuilt with the csc.exe that ships with Windows.
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Star Citizen Anti AFK")]
@@ -33,6 +40,10 @@ namespace AntiAfk
         public const uint KEYEVENTF_EXTENDEDKEY = 1, KEYEVENTF_KEYUP = 2, KEYEVENTF_SCANCODE = 8;
         public const uint MOUSEEVENTF_MOVE = 1;
         public const int WM_HOTKEY = 0x0312;
+        public const int WM_INPUT = 0x00FF;
+        public const uint RIDEV_INPUTSINK = 0x00000100;
+        public const uint RID_HEADER = 0x10000005;
+        public const uint RIM_TYPEMOUSE = 0, RIM_TYPEKEYBOARD = 1;
         public const uint MOD_NOREPEAT = 0x4000;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -72,6 +83,14 @@ namespace AntiAfk
         [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
         [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool altTab);
         [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] public struct RAWINPUTDEVICE { public ushort usUsagePage; public ushort usUsage; public uint dwFlags; public IntPtr hwndTarget; }
+        [StructLayout(LayoutKind.Sequential)] public struct RAWINPUTHEADER { public uint dwType; public uint dwSize; public IntPtr hDevice; public IntPtr wParam; }
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devices, uint count, uint size);
+        [DllImport("user32.dll")] public static extern uint GetRawInputData(IntPtr hRawInput, uint command, IntPtr data, ref uint size, uint headerSize);
+        [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT pt);
         [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
         /// <summary>Tick count (same clock as GetTickCount) of the last input event in this session.</summary>
@@ -123,6 +142,21 @@ namespace AntiAfk
             Send(Key(key, scan, flags));
             Thread.Sleep(holdMs);
             Send(Key(key, scan, flags | Native.KEYEVENTF_KEYUP));
+        }
+
+        /// <summary>Keys that open a Star Citizen screen (F1 mobiGlas, F2 map, F11 social list) instead of doing nothing.</summary>
+        public static bool OpensMenu(Keys key)
+        {
+            return key == Keys.F1 || key == Keys.F2 || key == Keys.F11;
+        }
+
+        /// <summary>Tap a key; for menu keys tap it again after a short pause so the screen it opened closes again.</summary>
+        public static void AfkKey(Keys key, int holdMs)
+        {
+            TapKey(key, holdMs);
+            if (!OpensMenu(key)) return;
+            Thread.Sleep(1500);   // the game ignores a second press that comes much sooner
+            TapKey(key, holdMs);
         }
 
         static void MoveRel(int dx)
@@ -192,6 +226,22 @@ namespace AntiAfk
             return fpid == pid;
         }
 
+        public static bool TryGetWindow(out IntPtr hwnd, out uint pid) { return Find(out hwnd, out pid); }
+
+        public static bool IsForeground(uint pid) { return GameIsForeground(pid); }
+
+        /// <summary>The game window's client area in screen coordinates.</summary>
+        public static bool ClientScreenRect(IntPtr hwnd, out Rectangle r)
+        {
+            r = Rectangle.Empty;
+            Native.RECT rc;
+            if (!Native.GetClientRect(hwnd, out rc)) return false;
+            Native.POINT pt = new Native.POINT();
+            if (!Native.ClientToScreen(hwnd, ref pt)) return false;
+            r = new Rectangle(pt.X, pt.Y, rc.Right - rc.Left, rc.Bottom - rc.Top);
+            return true;
+        }
+
         /// <summary>
         /// Brings StarCitizen.exe to the foreground. NotRunning means nothing was touched, so the
         /// currently active window stays active. Never throws.
@@ -244,6 +294,13 @@ namespace AntiAfk
         public int HotMods = 2 | 4;          // Win32 MOD_ flags: 1 Alt, 2 Ctrl, 4 Shift
         public int Tray = 1;                 // hide to tray when minimized
         public int FocusGame = 1;            // switch to StarCitizen.exe before each AFK input
+        public int AcceptMission = 0;        // auto-accept shared missions/contracts (OCR)
+        public int AcceptParty = 0;          // auto-accept party invites (OCR)
+        public int AcceptVk = (int)Keys.OemOpenBrackets; // key that accepts a prompt: [
+        public int ScanMs = 800;             // how often the screen is read
+        public int Debug = 0;                // 1 = save what the scanner sees next to the ini
+        public string MissionWords = "contract shared";  // ';'-separated phrases that identify a mission prompt
+        public string PartyWords = "party invite";       // ... and a party invite prompt
 
         const string FileName = "StarCitizenAntiAFK.ini";
         const string LegacyFileName = "AntiAFK.ini";
@@ -280,8 +337,11 @@ namespace AntiAfk
                         int eq = line.IndexOf('=');
                         if (eq <= 0) continue;
                         string k = line.Substring(0, eq).Trim();
+                        string raw = line.Substring(eq + 1).Trim();
+                        if (k == "MissionWords") { s.MissionWords = raw; continue; }
+                        if (k == "PartyWords") { s.PartyWords = raw; continue; }
                         int v;
-                        if (!int.TryParse(line.Substring(eq + 1).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) continue;
+                        if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) continue;
                         switch (k)
                         {
                             case "IdleSeconds": s.IdleSeconds = v; break;
@@ -292,6 +352,11 @@ namespace AntiAfk
                             case "HotMods": s.HotMods = v; break;
                             case "Tray": s.Tray = v; break;
                             case "FocusGame": s.FocusGame = v; break;
+                            case "AcceptMission": s.AcceptMission = v; break;
+                            case "AcceptParty": s.AcceptParty = v; break;
+                            case "AcceptVk": s.AcceptVk = v; break;
+                            case "ScanMs": s.ScanMs = v; break;
+                            case "Debug": s.Debug = v; break;
                         }
                     }
                     break;
@@ -306,7 +371,33 @@ namespace AntiAfk
             s.HotMods &= 7;
             s.Tray = s.Tray == 0 ? 0 : 1;
             s.FocusGame = s.FocusGame == 0 ? 0 : 1;
+            s.AcceptMission = s.AcceptMission == 1 ? 1 : 0;
+            s.AcceptParty = s.AcceptParty == 1 ? 1 : 0;
+            if (s.AcceptVk < 1 || s.AcceptVk > 254) s.AcceptVk = (int)Keys.OemOpenBrackets;
+            s.ScanMs = Math.Max(300, Math.Min(5000, s.ScanMs));
+            s.Debug = s.Debug == 1 ? 1 : 0;
+            if (string.IsNullOrEmpty(s.MissionWords)) s.MissionWords = "contract shared";
+            if (string.IsNullOrEmpty(s.PartyWords)) s.PartyWords = "party invite";
             return s;
+        }
+
+        /// <summary>A writable folder next to the settings file (used only for the optional debug dump).</summary>
+        public static string DataDir()
+        {
+            foreach (string p in Paths())
+            {
+                string d = Path.GetDirectoryName(p);
+                try
+                {
+                    Directory.CreateDirectory(d);
+                    string probe = Path.Combine(d, ".write-test");
+                    File.WriteAllText(probe, "x");
+                    File.Delete(probe);
+                    return d;
+                }
+                catch { }
+            }
+            return Path.GetTempPath();
         }
 
         public void Save()
@@ -320,6 +411,13 @@ namespace AntiAfk
             sb.AppendLine("HotMods=" + HotMods);
             sb.AppendLine("Tray=" + Tray);
             sb.AppendLine("FocusGame=" + FocusGame);
+            sb.AppendLine("AcceptMission=" + AcceptMission);
+            sb.AppendLine("AcceptParty=" + AcceptParty);
+            sb.AppendLine("AcceptVk=" + AcceptVk);
+            sb.AppendLine("ScanMs=" + ScanMs);
+            sb.AppendLine("Debug=" + Debug);
+            sb.AppendLine("MissionWords=" + MissionWords);
+            sb.AppendLine("PartyWords=" + PartyWords);
             foreach (string p in Paths())
             {
                 try
@@ -329,6 +427,287 @@ namespace AntiAfk
                     return;
                 }
                 catch { }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ Idle tracking
+    /// <summary>
+    /// Tracks when the USER last touched the keyboard/mouse. Input that the app injected itself (AFK keys,
+    /// wiggles, auto-accept presses) is recognised by its timestamp and ignored, so it never resets the idle
+    /// countdown and never counts as the user coming back.
+    /// </summary>
+    sealed class IdleTracker
+    {
+        public uint LastReal;
+        uint lastSeen;
+
+        public void Reset(uint lastInput) { LastReal = lastSeen = lastInput; }
+
+        /// <summary>Raw-input mode: a physical keyboard/mouse event happened at this tick.</summary>
+        public void MarkReal(uint tick) { LastReal = tick; }
+
+        /// <summary>Feed the latest system last-input tick plus the tick our own injection produced. True if it was the user.</summary>
+        public bool Observe(uint lastInput, uint ownTick)
+        {
+            if (lastInput == lastSeen) return false;
+            lastSeen = lastInput;
+            int d = unchecked((int)(lastInput - ownTick));
+            if (d >= 0 && d <= 250) return false;   // produced by us (allowing a little registration lag)
+            LastReal = lastInput;
+            return true;
+        }
+
+        public uint Idle(uint nowTick) { return unchecked(nowTick - LastReal); }
+    }
+
+    // --------------------------------------------------------- Text matching
+    static class Matcher
+    {
+        /// <summary>Lower-case letters and digits only, so OCR spacing/punctuation noise doesn't matter.</summary>
+        public static string Compact(string s)
+        {
+            if (s == null) return "";
+            StringBuilder sb = new StringBuilder(s.Length);
+            foreach (char c in s)
+                if (char.IsLetterOrDigit(c)) sb.Append(char.ToLowerInvariant(c));
+            return sb.ToString();
+        }
+
+        /// <summary>True if needle occurs in hay with at most maxErr single-character edits (Sellers' algorithm).</summary>
+        public static bool FuzzyContains(string hay, string needle, int maxErr)
+        {
+            int m = needle.Length;
+            if (m == 0) return false;
+            int[] prev = new int[m + 1], cur = new int[m + 1];
+            for (int i = 0; i <= m; i++) prev[i] = i;
+            if (prev[m] <= maxErr) return true;
+            for (int j = 0; j < hay.Length; j++)
+            {
+                cur[0] = 0; // a match may start anywhere in the text
+                for (int i = 1; i <= m; i++)
+                {
+                    int cost = needle[i - 1] == hay[j] ? 0 : 1;
+                    int v = prev[i - 1] + cost;
+                    if (prev[i] + 1 < v) v = prev[i] + 1;
+                    if (cur[i - 1] + 1 < v) v = cur[i - 1] + 1;
+                    cur[i] = v;
+                }
+                if (cur[m] <= maxErr) return true;
+                int[] t = prev; prev = cur; cur = t;
+            }
+            return false;
+        }
+
+        /// <summary>Does the OCR text contain any of the ';'-separated phrases (a couple of typos tolerated)?</summary>
+        public static bool ContainsAny(string ocrText, string phrases)
+        {
+            string hay = Compact(ocrText);
+            if (hay.Length == 0 || string.IsNullOrEmpty(phrases)) return false;
+            foreach (string p in phrases.Split(new char[] { ';' }))
+            {
+                string n = Compact(p);
+                if (n.Length < 4) continue;
+                if (FuzzyContains(hay, n, n.Length / 5)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Pulls the contract's name out of the OCR text of a "Contract Shared: ..." prompt: everything after the
+        /// first colon on the line that holds the title. Returns "" if the name couldn't be read.
+        /// </summary>
+        public static string ContractName(string ocrText, string phrases)
+        {
+            if (string.IsNullOrEmpty(ocrText)) return "";
+            foreach (string raw in ocrText.Split(new char[] { (char)10 }))
+            {
+                string line = raw.Trim();
+                if (!ContainsAny(line, phrases)) continue;
+                int i = line.IndexOfAny(new char[] { ':', ';' });
+                if (i < 0 || i + 1 >= line.Length) return "";
+                string name = line.Substring(i + 1).Trim();
+                name = Regex.Replace(name, @"\s+", " ");
+                return name.Trim(' ', '.', ',', '-', '|');
+            }
+            return "";
+        }
+
+        /// <summary>ACCEPT / DECLINE button labels visible, i.e. some prompt is on screen.</summary>
+        public static bool LooksLikePrompt(string ocrText)
+        {
+            string c = Compact(ocrText);
+            return FuzzyContains(c, "decline", 1) || FuzzyContains(c, "accept", 1);
+        }
+    }
+
+    // ------------------------------------------------------------ Image helpers
+    static class ImageOps
+    {
+        /// <summary>
+        /// The HUD text is near-white on a darker pill. Bright pixels become black and everything else white,
+        /// which is what OCR engines read best. Buffers are tightly packed BGRA.
+        /// </summary>
+        public static byte[] BrightToBlack(byte[] bgra, int threshold, out int maxLuma)
+        {
+            byte[] o = new byte[bgra.Length];
+            int mx = 0;
+            for (int i = 0; i + 3 < bgra.Length; i += 4)
+            {
+                int y = (bgra[i + 2] * 299 + bgra[i + 1] * 587 + bgra[i] * 114) / 1000;
+                if (y > mx) mx = y;
+                byte v = (byte)(y >= threshold ? 0 : 255);
+                o[i] = v; o[i + 1] = v; o[i + 2] = v; o[i + 3] = 255;
+            }
+            maxLuma = mx;
+            return o;
+        }
+
+        /// <summary>Copy with alpha forced to opaque (screen grabs can carry alpha 0).</summary>
+        public static byte[] Opaque(byte[] bgra)
+        {
+            byte[] o = (byte[])bgra.Clone();
+            for (int i = 3; i < o.Length; i += 4) o[i] = 255;
+            return o;
+        }
+
+        public static byte[] ToBgra(Bitmap bmp)
+        {
+            BitmapData d = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
+            {
+                byte[] raw = new byte[bmp.Width * 4 * bmp.Height];
+                if (d.Stride == bmp.Width * 4) Marshal.Copy(d.Scan0, raw, 0, raw.Length);
+                else
+                    for (int y = 0; y < bmp.Height; y++)
+                        Marshal.Copy(new IntPtr(d.Scan0.ToInt64() + (long)y * d.Stride), raw, y * bmp.Width * 4, bmp.Width * 4);
+                return raw;
+            }
+            finally { bmp.UnlockBits(d); }
+        }
+
+        public static void SavePng(byte[] bgra, int w, int h, string path)
+        {
+            using (Bitmap b = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+            {
+                BitmapData d = b.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                try { Marshal.Copy(bgra, 0, d.Scan0, Math.Min(bgra.Length, Math.Abs(d.Stride) * h)); }
+                finally { b.UnlockBits(d); }
+                b.Save(path, ImageFormat.Png);
+            }
+        }
+    }
+
+    // -------------------------------------------------- Windows built-in OCR
+    // Windows 10/11 ship an OCR engine (Windows.Media.Ocr). It is reached through reflection so the app needs
+    // no extra files, no Windows SDK and no references beyond the .NET Framework that comes with Windows.
+    static class WinOcr
+    {
+        static readonly object gate = new object();
+        static bool tried;
+        static int triedAt;
+        static string error = "";
+        static object engine;
+        static Type tResult;
+        static MethodInfo miRecognize, miCreateBitmap, miAsBuffer, miAsTaskDef;
+        static object pixBgra8, alphaPremul;
+        static int createArgs;
+
+        public static string Error { get { return error; } }
+
+        public static string Short(Exception ex)
+        {
+            while (ex.InnerException != null && (ex is TargetInvocationException || ex is AggregateException)) ex = ex.InnerException;
+            string m = ex.Message.Replace("\r", " ").Replace("\n", " ");
+            return m.Length > 110 ? m.Substring(0, 110) + "..." : m;
+        }
+
+        static Type WinRt(string fullName)
+        {
+            string ns = fullName.Substring(0, fullName.LastIndexOf('.'));
+            Type t = Type.GetType(fullName + ", " + ns + ", ContentType=WindowsRuntime", false);
+            if (t == null) t = Type.GetType(fullName + ", Windows.Foundation, ContentType=WindowsRuntime", false);
+            if (t == null) throw new InvalidOperationException("Windows type not found: " + fullName);
+            return t;
+        }
+
+        static bool Init()
+        {
+            lock (gate)
+            {
+                if (engine != null) return true;
+                // After a failure, try again every 30 s (e.g. once a language pack has been installed).
+                if (tried && unchecked(Environment.TickCount - triedAt) < 30000) return false;
+                tried = true; triedAt = Environment.TickCount;
+                try
+                {
+                    Assembly rt;
+                    try { rt = Assembly.Load("System.Runtime.WindowsRuntime, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"); }
+                    catch { rt = Assembly.Load("System.Runtime.WindowsRuntime"); }
+                    Type ext = rt.GetType("System.WindowsRuntimeSystemExtensions", true);
+                    Type bufExt = rt.GetType("System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions", true);
+                    miAsBuffer = bufExt.GetMethod("AsBuffer", new Type[] { typeof(byte[]) });
+                    foreach (MethodInfo m in ext.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                    {
+                        if (m.Name != "AsTask" || !m.IsGenericMethodDefinition) continue;
+                        ParameterInfo[] ps = m.GetParameters();
+                        if (ps.Length != 1 || m.GetGenericArguments().Length != 1) continue;
+                        Type pt = ps[0].ParameterType;
+                        if (pt.IsGenericType && pt.GetGenericTypeDefinition().Name == "IAsyncOperation`1") { miAsTaskDef = m; break; }
+                    }
+                    if (miAsBuffer == null || miAsTaskDef == null) { error = "Windows runtime helpers not found"; return false; }
+
+                    Type tEngine = WinRt("Windows.Media.Ocr.OcrEngine");
+                    object eng = tEngine.GetMethod("TryCreateFromUserProfileLanguages", BindingFlags.Public | BindingFlags.Static).Invoke(null, null);
+                    if (eng == null)
+                    {
+                        object lang = Activator.CreateInstance(WinRt("Windows.Globalization.Language"), new object[] { "en-US" });
+                        eng = tEngine.GetMethod("TryCreateFromLanguage", BindingFlags.Public | BindingFlags.Static).Invoke(null, new object[] { lang });
+                    }
+                    if (eng == null) { error = "no OCR language installed (add English in Windows language settings)"; return false; }
+
+                    miRecognize = tEngine.GetMethod("RecognizeAsync");
+                    tResult = miRecognize.ReturnType.GetGenericArguments()[0];
+                    Type tBmp = WinRt("Windows.Graphics.Imaging.SoftwareBitmap");
+                    pixBgra8 = Enum.ToObject(WinRt("Windows.Graphics.Imaging.BitmapPixelFormat"), 87);   // Bgra8
+                    alphaPremul = Enum.ToObject(WinRt("Windows.Graphics.Imaging.BitmapAlphaMode"), 0);   // Premultiplied
+                    foreach (MethodInfo m in tBmp.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                    {
+                        if (m.Name != "CreateCopyFromBuffer") continue;
+                        int n = m.GetParameters().Length;
+                        if (n == 5 || (n == 4 && miCreateBitmap == null)) { miCreateBitmap = m; createArgs = n; }
+                    }
+                    if (miCreateBitmap == null) { error = "SoftwareBitmap support not found"; return false; }
+
+                    engine = eng;
+                    error = "";
+                    return true;
+                }
+                catch (Exception ex) { error = Short(ex); engine = null; return false; }
+            }
+        }
+
+        /// <summary>Reads text from a BGRA image. Returns null if OCR isn't available (see Error).</summary>
+        public static string Recognize(byte[] bgra, int w, int h)
+        {
+            if (!Init()) return null;
+            object bmp = null;
+            try
+            {
+                object buf = miAsBuffer.Invoke(null, new object[] { bgra });
+                bmp = miCreateBitmap.Invoke(null, createArgs == 5 ? new object[] { buf, pixBgra8, w, h, alphaPremul } : new object[] { buf, pixBgra8, w, h });
+                object op = miRecognize.Invoke(engine, new object[] { bmp });
+                Task t = (Task)miAsTaskDef.MakeGenericMethod(tResult).Invoke(null, new object[] { op });
+                if (!t.Wait(4000)) { error = "OCR timed out"; return null; }
+                object res = t.GetType().GetProperty("Result").GetValue(t, null);
+                object text = res.GetType().GetProperty("Text").GetValue(res, null);
+                return text as string ?? "";
+            }
+            catch (Exception ex) { error = Short(ex); return null; }
+            finally
+            {
+                IDisposable d = bmp as IDisposable;
+                if (d != null) { try { d.Dispose(); } catch { } }
             }
         }
     }
@@ -676,15 +1055,35 @@ namespace AntiAfk
         readonly Stopwatch clock = Stopwatch.StartNew();
         readonly Icon[] icons = new Icon[3];
         uint ownTick;          // LastInputTick value produced by our own injected input
+        readonly IdleTracker idleT = new IdleTracker();
+        uint realAtAfk;        // IdleTracker.LastReal when AFK mode began; a change means the user is back
         long nextFireMs;
         int sent;
         FocusResult focus = FocusResult.NotRunning;
         bool hotkeyOk = true;
 
+        // Invite scanner (runs on its own thread; see ScanLoop)
+        readonly object injectLock = new object();   // serialises every SendInput burst + its fingerprint
+        Thread scanThread;
+        volatile bool running, closing;
+        long lastAcceptMs = -100000;
+        int accepted, blankScans;
+        string acceptedNote = "", lastScanText = "";
+        // Physical-input tracking (Raw Input). Joysticks and software-injected input never reach this.
+        bool rawOk;                 // raw input registered; otherwise fall back to GetLastInputInfo
+        uint physTick, lastPhysSeen;
+        IntPtr rawBuf = Marshal.AllocHGlobal(64);
+
+        readonly List<string> recentContracts = new List<string>();   // newest first, at most MaxRecent
+        const int MaxRecent = 5;
+        bool promptUp;         // an accept key was already sent for the prompt that is (probably) still on screen
+        int clearScans;        // consecutive scans without a recognised prompt
+
         StatusCard status;
         BigButton btn;
         NumField nfMin, nfSec, nfInt;
-        SwitchControl swMode, swTray, swFocus;
+        SwitchControl swMode, swTray, swFocus, swMission, swParty;
+        Label lblScan, lblRecent;
         KeyCapture kcKey, kcHot;
         Label lblKeyboard, lblMouse, lblKeyRow;
         NotifyIcon tray;
@@ -703,7 +1102,8 @@ namespace AntiAfk
             BackColor = Theme.Bg;
             ForeColor = Theme.Text;
             Font = Theme.Regular;
-            ClientSize = new Size(S(400), S(618));
+            ClientSize = new Size(S(400), S(846));
+            if (Height > Screen.PrimaryScreen.WorkingArea.Height) AutoScroll = true; // small/high-DPI screens
 
             icons[0] = MakeIcon(Theme.Grey);
             icons[1] = MakeIcon(Theme.Amber);
@@ -724,6 +1124,11 @@ namespace AntiAfk
 
             ResumeLayout(false);
             RefreshUi();
+
+            scanThread = new Thread(ScanLoop);
+            scanThread.IsBackground = true;
+            scanThread.Name = "InviteScanner";
+            scanThread.Start();
         }
 
         // ---------------------------------------------------------- UI building
@@ -785,8 +1190,19 @@ namespace AntiAfk
             swFocus = Place(action, new SwitchControl(), 292, 104, 46, 24);
             swFocus.Checked = cfg.FocusGame == 1;
 
+            // --- Auto-accept card
+            Card inv = Place(this, new Card(), 16, 454, 368, 242);
+            RowLabel(inv, "Auto-accept mission invites", 16, 10, 270);
+            swMission = Place(inv, new SwitchControl(), 292, 14, 46, 24);
+            swMission.Checked = cfg.AcceptMission == 1;
+            RowLabel(inv, "Auto-accept party invites", 16, 46, 270);
+            swParty = Place(inv, new SwitchControl(), 292, 50, 46, 24);
+            swParty.Checked = cfg.AcceptParty == 1;
+            lblScan = MakeLabel(inv, "Scanner idle - press Start", 16, 84, 336, 36, Theme.Muted, Theme.Small, ContentAlignment.TopLeft, Theme.Card);
+            lblRecent = MakeLabel(inv, RecentText(), 16, 124, 336, 108, Theme.Muted, Theme.Small, ContentAlignment.TopLeft, Theme.Card);
+
             // --- Controls card
-            Card ctl = Place(this, new Card(), 16, 454, 368, 100);
+            Card ctl = Place(this, new Card(), 16, 706, 368, 100);
             RowLabel(ctl, "Start / stop hotkey", 16, 12, 150);
             kcHot = Place(ctl, new KeyCapture(true), 168, 12, 170, 32);
             kcHot.Set((Keys)cfg.HotVk, cfg.HotMods);
@@ -794,7 +1210,7 @@ namespace AntiAfk
             swTray = Place(ctl, new SwitchControl(), 292, 60, 46, 24);
             swTray.Checked = cfg.Tray == 1;
 
-            MakeLabel(this, "Settings are saved next to the app. No registry entries.", 16, 572, 368, 24,
+            MakeLabel(this, "Settings are saved next to the app. No registry entries.", 16, 814, 368, 24,
                 Theme.Accent, Theme.Small, ContentAlignment.MiddleCenter, Theme.Bg);
 
             swMode.Checked = cfg.Mode == 1;
@@ -807,6 +1223,8 @@ namespace AntiAfk
             swMode.CheckedChanged += delegate { cfg.Mode = swMode.Checked ? 1 : 0; ApplyModeVisuals(); cfg.Save(); };
             swFocus.CheckedChanged += delegate { cfg.FocusGame = swFocus.Checked ? 1 : 0; cfg.Save(); };
             swTray.CheckedChanged += delegate { cfg.Tray = swTray.Checked ? 1 : 0; cfg.Save(); };
+            swMission.CheckedChanged += delegate { cfg.AcceptMission = swMission.Checked ? 1 : 0; cfg.Save(); };
+            swParty.CheckedChanged += delegate { cfg.AcceptParty = swParty.Checked ? 1 : 0; cfg.Save(); };
             kcKey.Changed += delegate { cfg.KeyVk = (int)kcKey.Key; cfg.Save(); };
             kcHot.CaptureBegan += delegate { Native.UnregisterHotKey(Handle, HOTKEY_ID); };
             kcHot.Changed += delegate { cfg.HotVk = (int)kcHot.Key; cfg.HotMods = kcHot.Mods; cfg.Save(); };
@@ -885,7 +1303,37 @@ namespace AntiAfk
             if (Native.DwmSetWindowAttribute(Handle, 20, ref on, 4) != 0)
                 Native.DwmSetWindowAttribute(Handle, 19, ref on, 4);
             RegisterHotkey();
+            RegisterRawInput();
             RefreshUi();
+        }
+
+        /// <summary>
+        /// Ask Windows for raw keyboard and mouse input, delivered to this window even in the background.
+        /// Events from real devices carry a device handle; input injected by software (this app's own keys,
+        /// macro or joystick-mapping tools) carries none, and joysticks aren't keyboards or mice at all.
+        /// </summary>
+        void RegisterRawInput()
+        {
+            try
+            {
+                Native.RAWINPUTDEVICE[] d = new Native.RAWINPUTDEVICE[2];
+                d[0].usUsagePage = 1; d[0].usUsage = 2; d[0].dwFlags = Native.RIDEV_INPUTSINK; d[0].hwndTarget = Handle;  // mouse
+                d[1].usUsagePage = 1; d[1].usUsage = 6; d[1].dwFlags = Native.RIDEV_INPUTSINK; d[1].hwndTarget = Handle;  // keyboard
+                rawOk = Native.RegisterRawInputDevices(d, 2, (uint)Marshal.SizeOf(typeof(Native.RAWINPUTDEVICE)));
+            }
+            catch { rawOk = false; }
+        }
+
+        void OnRawInput(IntPtr hRaw)
+        {
+            uint now = Native.GetTickCount();
+            if (unchecked(now - physTick) < 15) return;   // mice report hundreds of times a second; one per 15 ms is plenty
+            uint hdrSize = (uint)Marshal.SizeOf(typeof(Native.RAWINPUTHEADER)), size = hdrSize;
+            if (Native.GetRawInputData(hRaw, Native.RID_HEADER, rawBuf, ref size, hdrSize) == uint.MaxValue) return;
+            Native.RAWINPUTHEADER hdr = (Native.RAWINPUTHEADER)Marshal.PtrToStructure(rawBuf, typeof(Native.RAWINPUTHEADER));
+            if (hdr.hDevice == IntPtr.Zero) return;       // injected by software, including this app's own presses
+            if (hdr.dwType != Native.RIM_TYPEMOUSE && hdr.dwType != Native.RIM_TYPEKEYBOARD) return;
+            physTick = now;
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
@@ -908,11 +1356,14 @@ namespace AntiAfk
                 SetRunning(state == RunState.Stopped);
                 return;
             }
+            if (m.Msg == Native.WM_INPUT) OnRawInput(m.LParam);   // then fall through so Windows can clean up
             base.WndProc(ref m);
         }
 
         void Shutdown()
         {
+            closing = true;
+            running = false;
             timer.Stop();
             cfg.Save();
             try { Native.UnregisterHotKey(Handle, HOTKEY_ID); } catch { }
@@ -923,11 +1374,14 @@ namespace AntiAfk
         // ------------------------------------------------------------ Engine
         void SetRunning(bool run)
         {
+            running = run;
             if (run)
             {
                 state = RunState.Waiting;
                 sent = 0;
                 focus = FocusResult.NotRunning;
+                idleT.Reset(rawOk ? Native.GetTickCount() : Native.LastInputTick());
+                lastPhysSeen = physTick;
                 timer.Start();
             }
             else
@@ -940,8 +1394,22 @@ namespace AntiAfk
 
         void Tick()
         {
-            uint last = Native.LastInputTick();
-            uint idle = unchecked(Native.GetTickCount() - last);
+            uint last, ownSnap;
+            // An auto-accept key press may be in flight on the scanner thread. Skip this tick rather than
+            // mistaking our own key press for the user.
+            if (!Monitor.TryEnter(injectLock)) return;
+            try { last = Native.LastInputTick(); ownSnap = ownTick; }
+            finally { Monitor.Exit(injectLock); }
+
+            bool real;
+            if (rawOk)
+            {
+                // Only physical keyboard/mouse events count. Joysticks, macro tools and our own presses don't.
+                real = physTick != lastPhysSeen;
+                if (real) { lastPhysSeen = physTick; idleT.MarkReal(physTick); }
+            }
+            else real = idleT.Observe(last, ownSnap);   // fallback: system last-input time, ignoring our own input
+            uint idle = idleT.Idle(Native.GetTickCount());
             long now = clock.ElapsedMilliseconds;
             uint thresholdMs = (uint)cfg.IdleSeconds * 1000u;
 
@@ -951,7 +1419,7 @@ namespace AntiAfk
                 {
                     state = RunState.Afk;
                     sent = 0;
-                    ownTick = last;
+                    realAtAfk = idleT.LastReal;
                     nextFireMs = now + (Fire() ? cfg.IntervalSeconds * 1000L : 3000L); // retry soon if focus failed
                     RefreshUi();
                     return;
@@ -959,7 +1427,7 @@ namespace AntiAfk
             }
             else if (state == RunState.Afk)
             {
-                if (unchecked((int)(last - ownTick)) > 250)
+                if (idleT.LastReal != realAtAfk)
                 {
                     // Something other than us produced input: the user is back.
                     state = RunState.Waiting;
@@ -986,17 +1454,226 @@ namespace AntiAfk
                     // round rather than typing into whatever window happens to be active (e.g. a browser).
                     if (focus != FocusResult.Focused) ok = false;
                 }
-                if (ok)
-                {
-                    if (cfg.Mode == 1) Injector.Wiggle(10);
-                    else Injector.TapKey((Keys)cfg.KeyVk, 50);
-                    sent++;
-                }
             }
             catch { ok = false; }
-            Thread.Sleep(40); // let the system register our own input before fingerprinting it
-            ownTick = Native.LastInputTick();
+
+            lock (injectLock)
+            {
+                try
+                {
+                    if (ok)
+                    {
+                        if (cfg.Mode == 1) Injector.Wiggle(10);
+                        else Injector.AfkKey((Keys)cfg.KeyVk, 50);
+                        sent++;
+                    }
+                }
+                catch { ok = false; }
+                Thread.Sleep(40); // let the system register our own input before fingerprinting it
+                ownTick = Native.LastInputTick();
+            }
             return ok;
+        }
+
+        // ------------------------------------------------------ Invite scanner
+        // Runs on a background thread: grab the top-centre of the game window (where the HUD shows
+        // "Party Invite Received" / "Contract Shared" with ACCEPT [ and DECLINE ] buttons), OCR it, and
+        // press [ when a prompt for an enabled option is on screen.
+
+        void SetScan(string msg)
+        {
+            string full = acceptedNote.Length > 0 ? msg + "\n" + acceptedNote : msg;
+            if (full == lastScanText) return;
+            try
+            {
+                if (IsHandleCreated && !IsDisposed)
+                {
+                    lastScanText = full;
+                    BeginInvoke(new MethodInvoker(delegate { lblScan.Text = full; }));
+                }
+            }
+            catch { }
+        }
+
+        static string Snip(string s, int n)
+        {
+            s = (s ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+            return s.Length <= n ? s : s.Substring(0, n) + "...";
+        }
+
+        void ScanLoop()
+        {
+            while (!closing)
+            {
+                try
+                {
+                    if (!running) SetScan("Scanner idle - press Start");
+                    else if (cfg.AcceptMission == 0 && cfg.AcceptParty == 0) SetScan("Both auto-accept options are off");
+                    else ScanOnce();
+                }
+                catch (Exception ex) { SetScan("Scan error: " + WinOcr.Short(ex)); }
+                Thread.Sleep(cfg.ScanMs);
+            }
+        }
+
+        byte[] Grab(Rectangle reg, double scale, out int w, out int h)
+        {
+            using (Bitmap src = new Bitmap(reg.Width, reg.Height, PixelFormat.Format32bppArgb))
+            {
+                using (Graphics g1 = Graphics.FromImage(src))
+                    g1.CopyFromScreen(reg.X, reg.Y, 0, 0, reg.Size, CopyPixelOperation.SourceCopy);
+                if (scale == 1.0) { w = src.Width; h = src.Height; return ImageOps.ToBgra(src); }
+                w = (int)(src.Width * scale); h = (int)(src.Height * scale);
+                using (Bitmap big = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+                {
+                    using (Graphics g2 = Graphics.FromImage(big))
+                    {
+                        g2.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g2.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                        g2.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel);
+                    }
+                    return ImageOps.ToBgra(big);
+                }
+            }
+        }
+
+        string Classify(string text)
+        {
+            if (Matcher.ContainsAny(text, cfg.PartyWords)) return "party";
+            if (Matcher.ContainsAny(text, cfg.MissionWords)) return "mission";
+            return null;
+        }
+
+        void ScanOnce()
+        {
+            IntPtr hwnd; uint pid; Rectangle rc;
+            if (!GameFocus.TryGetWindow(out hwnd, out pid)) { SetScan("Star Citizen is not running"); return; }
+            if (Native.IsIconic(hwnd)) { SetScan("Star Citizen is minimized - can't read the screen"); return; }
+            if (!GameFocus.ClientScreenRect(hwnd, out rc) || rc.Width < 640 || rc.Height < 360) { SetScan("Can't read the Star Citizen window size"); return; }
+
+            // The prompt sits at the top centre; read a band around it (28%-72% across, top 22%).
+            Rectangle reg = new Rectangle(rc.X + (int)(rc.Width * 0.28), rc.Y, (int)(rc.Width * 0.44), (int)(rc.Height * 0.22));
+            double scale = rc.Height >= 1300 ? 1.0 : 2.0;      // small HUD text reads better enlarged
+            if (reg.Width * scale > 2500) scale = 2500.0 / reg.Width;
+
+            int w, h, maxLuma;
+            byte[] px = Grab(reg, scale, out w, out h);
+            byte[] bw = ImageOps.BrightToBlack(px, 150, out maxLuma);
+            if (maxLuma < 8)
+            {
+                if (++blankScans >= 3) SetScan("Capture is black - use Borderless or Windowed mode");
+                return;
+            }
+            blankScans = 0;
+
+            string t1 = WinOcr.Recognize(bw, w, h);
+            if (t1 == null) { SetScan("OCR unavailable: " + WinOcr.Error); return; }
+            string kind = Classify(t1), t2 = null, t3 = null, kindText = t1;
+            if (kind == null && Matcher.LooksLikePrompt(t1))
+            {
+                // A prompt is on screen but its title wasn't read: retry with other image processing.
+                t2 = WinOcr.Recognize(ImageOps.Opaque(px), w, h);
+                if (t2 != null) { kind = Classify(t2); kindText = t2; }
+                if (kind == null)
+                {
+                    int ml;
+                    t3 = WinOcr.Recognize(ImageOps.BrightToBlack(px, 110, out ml), w, h);
+                    if (t3 != null) { kind = Classify(t3); kindText = t3; }
+                }
+            }
+
+            if (cfg.Debug == 1) DebugDump(px, bw, w, h, t1, t2, t3, kind);
+
+            if (kind == null)
+            {
+                if (++clearScans >= 2) promptUp = false;   // prompt is gone: ready for the next one
+                if (Matcher.LooksLikePrompt(t1)) SetScan("Prompt seen but not recognized: " + Snip(t1, 24));
+                else SetScan("Watching for invites...");
+                return;
+            }
+            clearScans = 0;
+
+            bool wanted = kind == "mission" ? cfg.AcceptMission == 1 : cfg.AcceptParty == 1;
+            string label = kind == "mission" ? "mission invite" : "party invite";
+            if (!wanted) { SetScan("Saw a " + label + " (auto-accept for it is off)"); return; }
+            Accept(label, pid, kind == "mission" ? Matcher.ContractName(kindText, cfg.MissionWords) : "");
+        }
+
+        void Accept(string label, uint pid, string contract)
+        {
+            long now = clock.ElapsedMilliseconds;
+            if (now - lastAcceptMs < 3000) return;   // give the prompt time to go away after the key press
+            if (promptUp && now - lastAcceptMs < 15000) return;   // one press per prompt; retry only if it's still up after 15 s
+
+            if (!GameFocus.IsForeground(pid))
+            {
+                if (cfg.FocusGame != 1) { SetScan("Saw a " + label + " but Star Citizen isn't the active window"); return; }
+                FocusResult fr = FocusResult.Failed;
+                try { fr = (FocusResult)Invoke(new Func<FocusResult>(GameFocus.Activate)); } catch { }
+                if (fr != FocusResult.Focused) { SetScan("Saw a " + label + " but couldn't focus Star Citizen"); return; }
+            }
+
+            lock (injectLock)
+            {
+                Injector.TapKey((Keys)cfg.AcceptVk, 80);
+                Thread.Sleep(40);
+                ownTick = Native.LastInputTick();   // so the AFK logic doesn't mistake this for the user
+            }
+            lastAcceptMs = now;
+            promptUp = true;
+            accepted++;
+            acceptedNote = "Last accepted: " + label + " at " + DateTime.Now.ToString("h:mm:ss tt") + "  (" + accepted + " total)";
+            if (contract.Length > 0)
+            {
+                lock (recentContracts)
+                {
+                    recentContracts.Insert(0, contract);
+                    while (recentContracts.Count > MaxRecent) recentContracts.RemoveAt(recentContracts.Count - 1);
+                }
+                ShowRecent();
+            }
+            SetScan("Accepted a " + label);
+        }
+
+        string RecentText()
+        {
+            StringBuilder sb = new StringBuilder("Last " + MaxRecent + " accepted contracts:");
+            lock (recentContracts)
+            {
+                if (recentContracts.Count == 0) sb.Append("\n  none yet");
+                for (int i = 0; i < recentContracts.Count; i++)
+                {
+                    string n = recentContracts[i];
+                    if (n.Length > 46) n = n.Substring(0, 45).TrimEnd(new char[] { (char)32 }) + "...";
+                    sb.Append("\n" + (i + 1) + ".  " + n);
+                }
+            }
+            return sb.ToString();
+        }
+
+        void ShowRecent()
+        {
+            string t = RecentText();
+            try
+            {
+                if (IsHandleCreated && !IsDisposed) BeginInvoke(new MethodInvoker(delegate { lblRecent.Text = t; }));
+            }
+            catch { }
+        }
+
+        void DebugDump(byte[] raw, byte[] bw, int w, int h, string t1, string t2, string t3, string kind)
+        {
+            try
+            {
+                string dir = Path.Combine(Settings.DataDir(), "ocr-debug");
+                Directory.CreateDirectory(dir);
+                ImageOps.SavePng(ImageOps.Opaque(raw), w, h, Path.Combine(dir, "last_raw.png"));
+                ImageOps.SavePng(bw, w, h, Path.Combine(dir, "last_bw.png"));
+                File.WriteAllText(Path.Combine(dir, "last_ocr.txt"),
+                    DateTime.Now.ToString("s") + "  kind=" + (kind ?? "none") + "\r\n--- bw150 ---\r\n" + t1 +
+                    "\r\n--- raw ---\r\n" + t2 + "\r\n--- bw110 ---\r\n" + t3 + "\r\n");
+            }
+            catch { }
         }
 
         string FocusNote()
@@ -1025,7 +1702,7 @@ namespace AntiAfk
             tray.Icon = ic;
             string tip = state == RunState.Stopped ? "Star Citizen Anti AFK - stopped" : (state == RunState.Waiting ? "Star Citizen Anti AFK - waiting for idle" : "Star Citizen Anti AFK - AFK input active");
             tray.Text = tip;
-            RefreshStatus(unchecked(Native.GetTickCount() - Native.LastInputTick()), clock.ElapsedMilliseconds);
+            RefreshStatus(idleT.Idle(Native.GetTickCount()), clock.ElapsedMilliseconds);
         }
 
         void RefreshStatus(uint idleMs, long now)
@@ -1064,11 +1741,25 @@ namespace AntiAfk
             bool created;
             using (Mutex mtx = new Mutex(true, "Local\\StarCitizenAntiAFK.SingleInstance", out created))
             {
-                if (!created) return;
-                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) Theme.Scale = g.DpiX / 96f;
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm());
+                if (!created)
+                {
+                    MessageBox.Show("Star Citizen Anti AFK is already running.\n\nLook for its icon in the system tray (the ^ arrow next to the clock), " +
+                        "or end \"StarCitizenAntiAFK\" in Task Manager and start it again.",
+                        "Star Citizen Anti AFK", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                try
+                {
+                    using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) Theme.Scale = g.DpiX / 96f;
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    Application.Run(new MainForm());
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Star Citizen Anti AFK couldn't start:\n\n" + ex, "Star Citizen Anti AFK",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
         }
     }
