@@ -7,6 +7,8 @@ back to waiting.
 
 Made by **C0P3Y** | **Icarus Interstellar Inc.**
 
+<img src="screenshots/StarCitizenAntiAFK-2.png"><img src="screenshots/StarCitizenAntiAFK.png">
+
 ## Features
 
 - Single small `.exe` (~60 KB). No installer, no runtime to install (uses the .NET Framework built into Windows).
