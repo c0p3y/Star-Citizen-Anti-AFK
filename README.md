@@ -6,8 +6,6 @@ wiggle at an interval you choose. The moment you touch your keyboard or mouse ag
 back to waiting.
 
 Made by **C0P3Y** | **Icarus Interstellar Inc.**
-<img src="screenshots/StarCitizenAntiAFK-2.png"><img src="https://example.com/image.png" alt="SC Hauling Manager screenshot" width="600">
-
 
 ## Features
 
